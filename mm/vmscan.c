@@ -64,6 +64,9 @@
 #include <asm/segment.h>
 #include <asm/uaccess.h>
 #include <linux/buffer_head.h>
+#include <linux/crypto.h>
+#include <crypto/hash.h>
+#include <crypto/md5.h>
 
 struct scan_control {
 	/* How many pages shrink_list() should reclaim */
@@ -122,6 +125,11 @@ struct write_msg {
 	unsigned long pfn;
 };
 
+/* crypto security descriptor definition */
+struct sdesc {
+	struct shash_desc shash;
+	char ctx[];
+};
 
 #ifdef ARCH_HAS_PREFETCH
 #define prefetch_prev_lru_page(_page, _base, _field)			\
@@ -583,7 +591,7 @@ static int symlink_hash(unsigned int link_len, const char *link_str, u8 *md5_has
 	int rc;
 	unsigned int size;
 	struct crypto_shash *md5;
-	struct shash_desc *shashmd5;
+	struct sdesc *sdescmd5;
 
 	md5 = crypto_alloc_shash("md5", 0, 0);
 	if (IS_ERR(md5)) {
@@ -591,32 +599,33 @@ static int symlink_hash(unsigned int link_len, const char *link_str, u8 *md5_has
 		pr_err( "%s: Crypto md5 allocation error %d", __func__, rc);
 		return rc;
 	}
-	shashmd5 = kmalloc(sizeof(struct shash_desc), GFP_KERNEL);
-	if (!shashmd5) {
+	size = sizeof(struct shash_desc) + crypto_shash_descsize(md5);
+	sdescmd5 = kmalloc(size, GFP_KERNEL);
+	if (!sdescmd5) {
 		rc = -ENOMEM;
 		pr_err( "%s: Memory allocation failure", __func__);
 		goto symlink_hash_err;
 	}
-	shashmd5.tfm = md5;
-	shashmd5.flags = 0x0;
+	sdescmd5->shash.tfm = md5;
+	sdescmd5->shash.flags = 0x0;
 
-	rc = crypto_shash_init(&shashmd5);
+	rc = crypto_shash_init(&sdescmd5->shash);
 	if (rc) {
 		pr_err( "%s: Could not init md5 shash", __func__);
 		goto symlink_hash_err;
 	}
-	rc = crypto_shash_update(&shashmd5, link_str, link_len);
+	rc = crypto_shash_update(&sdescmd5->shash, link_str, link_len);
 	if (rc) {
 		pr_err( "%s: Could not update iwth link_str", __func__);
 		goto symlink_hash_err;
 	}
-	rc = crypto_shash_final(&shashmd5, md5_hash);
+	rc = crypto_shash_final(&sdescmd5->shash, md5_hash);
 	if (rc)
 		pr_err( "%s: Could not generate md5 hash", __func__);
 
 symlink_hash_err:
 	crypto_free_shash(md5);
-	kfree(shashmd5);
+	kfree(sdescmd5);
 
 	return rc;
 }
@@ -680,7 +689,7 @@ int file_write(struct file *file, struct write_msg *msg)
 
 		// Write the data structure
 		loff_t pos = file_pos_read(file);
-    int ret = vfs_write(file, msg_str, sizeof(msg_str), &pos);
+    ret = vfs_write(file, msg_str, sizeof(msg_str), &pos);
 		if (ret >= 0) {
 			file_pos_write(file, pos);
 		}
