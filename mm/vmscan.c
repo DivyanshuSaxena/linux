@@ -656,6 +656,7 @@ int md5_cal(char *rdma_buf, unsigned int nr_seg, unsigned long offset,
 // DEDUP: Functions to open/close a file, and write to a file
 struct file *file_open(const char *path) 
 {
+	printk("file_open() function started\n");
 	struct file *filp = NULL;
 	mm_segment_t oldfs;
 	int err = 0;
@@ -673,11 +674,13 @@ struct file *file_open(const char *path)
 
 void file_close(struct file *file) 
 {
+		printk("file_close() function started\n");
     filp_close(file, NULL);
 }
 
 int file_write(struct file *file, struct write_msg *msg)
 {
+		printk("file_write() function started\n");
     mm_segment_t oldfs;
     int ret;
 
@@ -688,11 +691,11 @@ int file_write(struct file *file, struct write_msg *msg)
 		snprintf(msg_str, sizeof(msg_str), "%d|%s|%s\n", msg->pfn, msg->pid, msg->hash);
 
 		// Write the data structure
-		loff_t pos = file_pos_read(file);
-    ret = vfs_write(file, msg_str, sizeof(msg_str), &pos);
-		if (ret >= 0) {
-			file_pos_write(file, pos);
-		}
+		// loff_t pos = file_pos_read(file);
+    ret = vfs_write(file, msg_str, sizeof(msg_str), 0);
+		// if (ret >= 0) {
+		// 	file_pos_write(file, pos);
+		// }
 
     set_fs(oldfs);
     return ret;
@@ -1285,6 +1288,7 @@ static unsigned long shrink_page_list(struct list_head *page_list,
 				goto keep_locked;
 
 			// DEDUP: Code Change here to calculate page hash and write to file.
+			printk("Starting the page hash calculation\n");
 			char *md5str = (char *)kzalloc(sizeof(char)*2*MD5_DIGEST_SIZE+1, GFP_KERNEL);
 			if(!md5str){
 				pr_err("null md5str\n");
@@ -1293,17 +1297,20 @@ static unsigned long shrink_page_list(struct list_head *page_list,
 			}
 			md5_cal(page_address(page),4096,0, page_to_pfn(page), md5str);
 
+			printk("Page Hash Calculated\n");
 			char *pid_str = (char *)kzalloc(sizeof(char)*8, GFP_KERNEL);
 			int pid = (int) (task_pid_nr(current));
 			sprintf(pid_str, "%d", pid);
 
+			printk("Writing to the struct\n");
 			struct write_msg msg;
 			strncpy(msg.pid, pid_str, 16);
 			strncpy(msg.hash, md5str, 32);
 			msg.pfn = page_to_pfn(page);
 
+			printk("Writing to file\n");
 			struct file *file_obj = file_open("/tmp/md5.dat");
-			file_write(file_obj, msg);
+			file_write(file_obj, &msg);
 			file_close(file_obj);
 
 
