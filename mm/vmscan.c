@@ -59,6 +59,12 @@
 #define CREATE_TRACE_POINTS
 #include <trace/events/vmscan.h>
 
+// DEDUP: Includes for writing to a file
+#include <linux/fs.h>
+#include <asm/segment.h>
+#include <asm/uaccess.h>
+#include <linux/buffer_head.h>
+
 struct scan_control {
 	/* How many pages shrink_list() should reclaim */
 	unsigned long nr_to_reclaim;
@@ -109,6 +115,13 @@ struct scan_control {
 	/* Number of pages freed so far during a call to shrink_zones() */
 	unsigned long nr_reclaimed;
 };
+
+struct write_msg {
+	char hash[32];
+	char pid[16];
+	unsigned long pfn;
+};
+
 
 #ifdef ARCH_HAS_PREFETCH
 #define prefetch_prev_lru_page(_page, _base, _field)			\
@@ -563,6 +576,118 @@ typedef enum {
 	/* page is clean and locked */
 	PAGE_CLEAN,
 } pageout_t;
+
+// DEDUP: Caclculating hash within the kernel
+static int symlink_hash(unsigned int link_len, const char *link_str, u8 *md5_hash)
+{
+	int rc;
+	unsigned int size;
+	struct crypto_shash *md5;
+	struct shash_desc *shashmd5;
+
+	md5 = crypto_alloc_shash("md5", 0, 0);
+	if (IS_ERR(md5)) {
+		rc = PTR_ERR(md5);
+		pr_err( "%s: Crypto md5 allocation error %d", __func__, rc);
+		return rc;
+	}
+	shashmd5 = kmalloc(sizeof(struct shash_desc), GFP_KERNEL);
+	if (!shashmd5) {
+		rc = -ENOMEM;
+		pr_err( "%s: Memory allocation failure", __func__);
+		goto symlink_hash_err;
+	}
+	shashmd5.tfm = md5;
+	shashmd5.flags = 0x0;
+
+	rc = crypto_shash_init(&shashmd5);
+	if (rc) {
+		pr_err( "%s: Could not init md5 shash", __func__);
+		goto symlink_hash_err;
+	}
+	rc = crypto_shash_update(&shashmd5, link_str, link_len);
+	if (rc) {
+		pr_err( "%s: Could not update iwth link_str", __func__);
+		goto symlink_hash_err;
+	}
+	rc = crypto_shash_final(&shashmd5, md5_hash);
+	if (rc)
+		pr_err( "%s: Could not generate md5 hash", __func__);
+
+symlink_hash_err:
+	crypto_free_shash(md5);
+	kfree(shashmd5);
+
+	return rc;
+}
+
+int md5_cal(char *rdma_buf, unsigned int nr_seg, unsigned long offset,
+						unsigned long pfn, char *md5str)
+{
+	unsigned char output[MD5_DIGEST_SIZE];
+	int i;
+		
+	if(nr_seg != 4096){
+		pr_err("page size is not 4096\n");
+		return -1;
+		
+	}
+	memset(output, 0x00,MD5_DIGEST_SIZE);	
+	//printk("%d\n", strlen(rdma_buf));
+	symlink_hash(nr_seg, rdma_buf, (u8 *)output);
+	//pr_info("Digest calc = [%*ph]\n", MD5_DIGEST_SIZE, output);
+	memset(md5str, 0,sizeof(char)*2*MD5_DIGEST_SIZE+1);	
+	for(i = 0; i < MD5_DIGEST_SIZE; i++) {snprintf(md5str+2*i,3,"%02x", output[i]);}
+	
+	pr_info("%s, pfn: %lx obj->hash: %s\n", __func__, pfn, md5str);
+	
+	return 0;
+}	
+
+// DEDUP: Functions to open/close a file, and write to a file
+struct file *file_open(const char *path) 
+{
+	struct file *filp = NULL;
+	mm_segment_t oldfs;
+	int err = 0;
+
+	oldfs = get_fs();
+	set_fs(get_ds());
+	filp = filp_open(path, O_APPEND|O_CREAT|O_WRONLY, 0755);
+	set_fs(oldfs);
+	if (IS_ERR(filp)) {
+			err = PTR_ERR(filp);
+			return NULL;
+	}
+	return filp;
+}
+
+void file_close(struct file *file) 
+{
+    filp_close(file, NULL);
+}
+
+int file_write(struct file *file, struct write_msg *msg)
+{
+    mm_segment_t oldfs;
+    int ret;
+
+    oldfs = get_fs();
+    set_fs(get_ds());
+
+		char *msg_str = (char *)kzalloc(sizeof(char)*60, GFP_KERNEL);
+		snprintf(msg_str, sizeof(msg_str), "%d|%s|%s\n", msg->pfn, msg->pid, msg->hash);
+
+		// Write the data structure
+		loff_t pos = file_pos_read(file);
+    int ret = vfs_write(file, msg_str, sizeof(msg_str), &pos);
+		if (ret >= 0) {
+			file_pos_write(file, pos);
+		}
+
+    set_fs(oldfs);
+    return ret;
+}
 
 /*
  * pageout is called by shrink_page_list() for each dirty page.
@@ -1149,6 +1274,29 @@ static unsigned long shrink_page_list(struct list_head *page_list,
 				goto keep_locked;
 			if (!sc->may_writepage)
 				goto keep_locked;
+
+			// DEDUP: Code Change here to calculate page hash and write to file.
+			char *md5str = (char *)kzalloc(sizeof(char)*2*MD5_DIGEST_SIZE+1, GFP_KERNEL);
+			if(!md5str){
+				pr_err("null md5str\n");
+				//return PAGE_ACTIVATE;	
+				goto keep_locked;
+			}
+			md5_cal(page_address(page),4096,0, page_to_pfn(page), md5str);
+
+			char *pid_str = (char *)kzalloc(sizeof(char)*8, GFP_KERNEL);
+			int pid = (int) (task_pid_nr(current));
+			sprintf(pid_str, "%d", pid);
+
+			struct write_msg msg;
+			strncpy(msg.pid, pid_str, 16);
+			strncpy(msg.hash, md5str, 32);
+			msg.pfn = page_to_pfn(page);
+
+			struct file *file_obj = file_open("/tmp/md5.dat");
+			file_write(file_obj, msg);
+			file_close(file_obj);
+
 
 			/*
 			 * Page is dirty. Flush the TLB if a writable entry
