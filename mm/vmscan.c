@@ -585,7 +585,7 @@ typedef enum {
 	PAGE_CLEAN,
 } pageout_t;
 
-// DEDUP: Caclculating hash within the kernel
+// DEDUP: Calculating hash within the kernel
 static int symlink_hash(unsigned int link_len, const char *link_str, u8 *md5_hash)
 {
 	int rc;
@@ -653,52 +653,42 @@ int md5_cal(char *rdma_buf, unsigned int nr_seg, unsigned long offset,
 	return 0;
 }	
 
-// DEDUP: Functions to open/close a file, and write to a file
-struct file *file_open(const char *path) 
+// DEDUP: Function to open/close a file, and write to a file
+int file_write(const char *path, struct write_msg *msg)
 {
-	printk("file_open() function started\n");
-	struct file *filp = NULL;
+	printk("file_write() function started\n");
+	struct file *file;
 	mm_segment_t oldfs;
-	int err = 0;
+	int ret;
 
 	oldfs = get_fs();
 	set_fs(get_ds());
-	filp = filp_open(path, O_APPEND|O_CREAT|O_WRONLY, 0755);
-	set_fs(oldfs);
-	if (IS_ERR(filp)) {
-			err = PTR_ERR(filp);
-			return NULL;
-	}
-	return filp;
-}
 
-void file_close(struct file *file) 
-{
-		printk("file_close() function started\n");
-    filp_close(file, NULL);
-}
+	// Open the path for writing
+	printk("Opening the file for write\n");
+	file = filp_open(path, O_APPEND|O_CREAT|O_WRONLY, 0755);
 
-int file_write(struct file *file, struct write_msg *msg)
-{
-		printk("file_write() function started\n");
-    mm_segment_t oldfs;
-    int ret;
-
-    oldfs = get_fs();
-    set_fs(get_ds());
-
+	if (file) {
+		printk("File opened\n");
 		char *msg_str = (char *)kzalloc(sizeof(char)*60, GFP_KERNEL);
 		snprintf(msg_str, sizeof(msg_str), "%d|%s|%s\n", msg->pfn, msg->pid, msg->hash);
 
 		// Write the data structure
 		// loff_t pos = file_pos_read(file);
-    ret = vfs_write(file, msg_str, sizeof(msg_str), 0);
+		ret = vfs_write(file, msg_str, 60, 0);
 		// if (ret >= 0) {
 		// 	file_pos_write(file, pos);
 		// }
 
-    set_fs(oldfs);
-    return ret;
+		// Close the file
+		printk("Closing the file\n");
+		filp_close(file, NULL);
+	}
+
+	// Reset the FS segment
+	set_fs(oldfs);
+
+	return ret;
 }
 
 /*
@@ -1309,10 +1299,7 @@ static unsigned long shrink_page_list(struct list_head *page_list,
 			msg.pfn = page_to_pfn(page);
 
 			printk("Writing to file\n");
-			struct file *file_obj = file_open("/tmp/md5.dat");
-			file_write(file_obj, &msg);
-			file_close(file_obj);
-
+			file_write("/tmp/md5.dat", &msg);
 
 			/*
 			 * Page is dirty. Flush the TLB if a writable entry
