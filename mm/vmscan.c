@@ -50,6 +50,14 @@
 
 #include <asm/tlbflush.h>
 #include <asm/div64.h>
+#include <linux/crypto.h>
+#include <crypto/hash.h>
+#include <crypto/md5.h>
+#include <linux/net.h>
+#include <linux/inet.h>
+#include <linux/in.h>
+#include <net/sock.h>
+
 
 #include <linux/swapops.h>
 #include <linux/balloon_compaction.h>
@@ -58,15 +66,6 @@
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/vmscan.h>
-
-// DEDUP: Includes for writing to a file
-#include <linux/fs.h>
-#include <asm/segment.h>
-#include <asm/uaccess.h>
-#include <linux/buffer_head.h>
-#include <linux/crypto.h>
-#include <crypto/hash.h>
-#include <crypto/md5.h>
 
 struct scan_control {
 	/* How many pages shrink_list() should reclaim */
@@ -117,12 +116,15 @@ struct scan_control {
 
 	/* Number of pages freed so far during a call to shrink_zones() */
 	unsigned long nr_reclaimed;
-};
 
-struct write_msg {
-	char hash[32];
-	char pid[16];
-	unsigned long pfn;
+
+	struct socket *ctr_sock;
+	spinlock_t  ctr_sock_lock;	
+	uint16_t ctr_port;			/* dst port in NBO */
+	u8 ctr_addr[16];			/* dst addr in NBO */
+	char *ctr_addr_str;			/* dst addr string */
+
+
 };
 
 /* crypto security descriptor definition */
@@ -130,6 +132,17 @@ struct sdesc {
 	struct shash_desc shash;
 	char ctx[];
 };
+
+struct send_msg{
+    unsigned long pfn;
+    unsigned long  flag;
+    char ops[8];
+    char hostid[16];
+		char pid[16];
+    char hash_v[32];
+};
+
+
 
 #ifdef ARCH_HAS_PREFETCH
 #define prefetch_prev_lru_page(_page, _base, _field)			\
@@ -585,8 +598,9 @@ typedef enum {
 	PAGE_CLEAN,
 } pageout_t;
 
-// DEDUP: Calculating hash within the kernel
-static int symlink_hash(unsigned int link_len, const char *link_str, u8 *md5_hash)
+
+static int
+symlink_hash(unsigned int link_len, const char *link_str, u8 *md5_hash)
 {
 	int rc;
 	unsigned int size;
@@ -630,17 +644,16 @@ symlink_hash_err:
 	return rc;
 }
 
-int md5_cal(char *rdma_buf, unsigned int nr_seg, unsigned long offset,
-						unsigned long pfn, char *md5str)
+
+int md5_cal(char *rdma_buf, unsigned int nr_seg, unsigned long offset, unsigned long pfn, char *md5str)
 {
 	unsigned char output[MD5_DIGEST_SIZE];
 	int i;
 		
-	if(nr_seg != 4096){
-		pr_err("page size is not 4096\n");
-		return -1;
-		
-	}
+	// if(nr_seg != 4096){
+	// 	pr_err("page size is not 4096\n");
+	// 	return -1;
+	// }
 	memset(output, 0x00,MD5_DIGEST_SIZE);	
 	//printk("%d\n", strlen(rdma_buf));
 	symlink_hash(nr_seg, rdma_buf, (u8 *)output);
@@ -648,48 +661,112 @@ int md5_cal(char *rdma_buf, unsigned int nr_seg, unsigned long offset,
 	memset(md5str, 0,sizeof(char)*2*MD5_DIGEST_SIZE+1);	
 	for(i = 0; i < MD5_DIGEST_SIZE; i++) {snprintf(md5str+2*i,3,"%02x", output[i]);}
 	
+	
 	pr_info("%s, pfn: %lx obj->hash: %s\n", __func__, pfn, md5str);
+//	hello_nl_send_msg(1231, md5str);	
 	
 	return 0;
 }	
 
-// DEDUP: Function to open/close a file, and write to a file
-int file_write(const char *path, struct write_msg *msg)
+int tcp_client_send(struct socket *sock, const struct send_msg *buf, const size_t length,unsigned long flags)
 {
-	printk("file_write() function started\n");
-	struct file *file;
-	mm_segment_t oldfs;
-	int ret;
+	struct msghdr msg;
+	//struct iovec iov;
+	struct kvec vec;
+	int len, written = 0;
+	int left = length;
+	mm_segment_t oldmm;
 
-	oldfs = get_fs();
-	set_fs(get_ds());
+	msg.msg_name    = 0;
+	msg.msg_namelen = 0;
+        
+	/*  msg.msg_iov     = &iov;
+		msg.msg_iovlen  = 1;*/
+	
+	msg.msg_control = NULL;
+	msg.msg_controllen = 0;
+	msg.msg_flags   = flags;
 
-	// Open the path for writing
-	printk("Opening the file for write\n");
-	file = filp_open(path, O_APPEND|O_CREAT|O_WRONLY, 0755);
+	oldmm = get_fs(); set_fs(KERNEL_DS);
+repeat_send:
+       
+	/* msg.msg_iov->iov_len  = left;
+		msg.msg_iov->iov_base = (char *)buf + written; */
+	
+	vec.iov_len = left;
+	vec.iov_base = (buf + written);
 
-	if (file) {
-		printk("File opened\n");
-		char *msg_str = (char *)kzalloc(sizeof(char)*60, GFP_KERNEL);
-		snprintf(msg_str, sizeof(msg_str), "%d|%s|%s\n", msg->pfn, msg->pid, msg->hash);
+	printk("before %s, %d, %s, %d, %lx\n", __func__, length, vec.iov_base,left,buf[0].pfn);
+	// len = sock_sendmsg(sock, &msg, left);
+	if(sock == NULL || buf == NULL ) {
+		pr_err("socket or buff is null\n");
+		return -1;
+	}
+	iov_iter_kvec(&msg.msg_iter, WRITE | ITER_KVEC, &vec, 1, left);
+	len = sock_sendmsg(sock, &msg);
+	printk("len=%d\n", len);
+	// len = kernel_sendmsg(sock, &msg, &vec, 1, left);
+        
+	if((len == -ERESTARTSYS) || (!(flags & MSG_DONTWAIT) && (len == -EAGAIN)))
+		goto repeat_send;
 
-		// Write the data structure
-		// loff_t pos = file_pos_read(file);
-		ret = vfs_write(file, msg_str, 60, 0);
-		// if (ret >= 0) {
-		// 	file_pos_write(file, pos);
-		// }
+	if(len > 0)
+	{
+		written += len;
+		left -= len;
+		if(left)
+			goto repeat_send;
+	}
+	set_fs(oldmm);
+	return written ? written:len;
+}
 
-		// Close the file
-		printk("Closing the file\n");
-		filp_close(file, NULL);
+int tcp_client_receive(struct socket *sock, unsigned long *str, unsigned long flags)
+{
+	//mm_segment_t oldmm;
+	struct msghdr msg;
+	//struct iovec iov;
+	struct kvec vec;
+	int len;
+	unsigned long repl;
+	int max_size =8 ; //sizeof(struct send_msg);
+
+	msg.msg_name    = 0;
+	msg.msg_namelen = 0;
+	/*
+	msg.msg_iov     = &iov;
+	msg.msg_iovlen  = 1;
+	*/
+	msg.msg_control = NULL;
+	msg.msg_controllen = 0;
+	msg.msg_flags   = flags;
+	/*
+	msg.msg_iov->iov_base   = str;
+	msg.msg_ioc->iov_len    = max_size; 
+	*/
+	vec.iov_len = max_size;
+	vec.iov_base = &repl; //str;
+
+	//oldmm = get_fs(); set_fs(KERNEL_DS);
+read_again:
+	//len = sock_recvmsg(sock, &msg, max_size, 0); 
+	len = kernel_recvmsg(sock, &msg, &vec, max_size, max_size, flags);
+
+	if(len == -EAGAIN || len == -ERESTARTSYS)
+	{
+		pr_info(" *** mtp | error while reading: %d | "
+						"tcp_client_receive *** \n", len);
+
+		goto read_again;
 	}
 
-	// Reset the FS segment
-	set_fs(oldfs);
 
-	return ret;
+	pr_info(" *** mtp | the server says: %lu | tcp_client_receive *** \n", repl);
+	//set_fs(oldmm);
+	return repl;
 }
+
+
 
 /*
  * pageout is called by shrink_page_list() for each dirty page.
@@ -734,8 +811,12 @@ static pageout_t pageout(struct page *page, struct address_space *mapping,
 		return PAGE_ACTIVATE;
 	if (!may_write_to_inode(mapping->host, sc))
 		return PAGE_KEEP;
+	
 
 	if (clear_page_dirty_for_io(page)) {
+
+
+
 		int res;
 		struct writeback_control wbc = {
 			.sync_mode = WB_SYNC_NONE,
@@ -749,11 +830,14 @@ static pageout_t pageout(struct page *page, struct address_space *mapping,
 		res = mapping->a_ops->writepage(page, &wbc);
 		if (res < 0)
 			handle_write_error(mapping, page, res);
+		
 		if (res == AOP_WRITEPAGE_ACTIVATE) {
 			ClearPageReclaim(page);
 			return PAGE_ACTIVATE;
 		}
 
+		printk("%s, pfn %lx\n", __func__, page_to_pfn(page));
+	
 		if (!PageWriteback(page)) {
 			/* synchronous write or broken a_ops? */
 			ClearPageReclaim(page);
@@ -1039,6 +1123,32 @@ static void page_check_dirty_writeback(struct page *page,
 		mapping->a_ops->is_dirty_writeback(page, dirty, writeback);
 }
 
+/*  in ibv_enables, the first step build_connection() from build_context()
+		before create_qp
+ */
+static void fill_sockaddr(struct sockaddr_storage *sin, uint16_t port, u8 *addr, uint8_t addr_type)
+{
+	memset(sin, 0, sizeof(*sin));
+
+	if (addr_type == AF_INET) {
+		struct sockaddr_in *sin4 = (struct sockaddr_in *)sin;
+		sin4->sin_family = AF_INET;
+		memcpy((void *)&sin4->sin_addr.s_addr, addr, 4);
+		sin4->sin_port = port;
+	} 
+	
+	/*else if (addr_type == AF_INET6) {
+		struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)sin;
+		sin6->sin6_family = AF_INET6;
+		memcpy((void *)&sin6->sin6_addr, addr, 16);
+		sin6->sin6_port = port;
+	}*/
+}
+
+
+
+
+
 /*
  * shrink_page_list() returns the number of reclaimed pages
  */
@@ -1064,7 +1174,42 @@ static unsigned long shrink_page_list(struct list_head *page_list,
 	unsigned long nr_immediate = 0;
 
 	cond_resched();
+/*	struct mem_cgroup * memcg;
+	memcg = sc->target_mem_cgroup;
+*/	
+	printk("%s, enter \n", __func__);
+	if( !sc->ctr_sock || sc->ctr_sock->state != SS_CONNECTED ){
+		printk("go into build connection\n");
+		int sock_ret;
+		struct sockaddr_storage ctr_sin;
+		sc->ctr_port = htons(12347);
+		// Use the IP address of the Python controller here. Currently => Localhost
+		in4_pton("127.0.0.1", -1, sc->ctr_addr, -1, NULL);
+		fill_sockaddr(&ctr_sin, sc->ctr_port, sc->ctr_addr, AF_INET );
+		sc->ctr_sock = (struct socket *)kzalloc(sizeof(struct socket), GFP_KERNEL);
+		sock_ret = sock_create(PF_INET, SOCK_STREAM, IPPROTO_TCP, &sc->ctr_sock);
+		/*create a socket*/  
+		if(sock_ret < 0)
+		{
+			pr_err("Error: %d while creating control socket \n", sock_ret);
+		}
+		sock_ret = kernel_connect(sc->ctr_sock, (struct sockaddr *)&ctr_sin, sizeof(struct sockaddr_in), 0);
+		if(sock_ret && (sock_ret != -EINPROGRESS))
+		{
+			pr_info("Error: %d while connecting data socket\n", sock_ret);
 
+		}
+	}
+	/*char *reply="test tcp connection";
+	tcp_client_send(sc->ctr_sock, reply, strlen(reply),MSG_DONTWAIT );*/
+/*	struct list_head *tmp_page_list;
+	tmp_page_list = page_list;
+	struct list_head *pos;
+	list_for_each(pos, tmp_page_list){
+		struct page *page;
+		page = list_entry(pos, struct page, lru);
+		printk("%s, pfn %lx\n", __func__, page_to_pfn(page));
+	}*/
 	while (!list_empty(page_list)) {
 		struct address_space *mapping;
 		struct page *page;
@@ -1277,29 +1422,53 @@ static unsigned long shrink_page_list(struct list_head *page_list,
 			if (!sc->may_writepage)
 				goto keep_locked;
 
-			// DEDUP: Code Change here to calculate page hash and write to file.
-			printk("Starting the page hash calculation\n");
+
 			char *md5str = (char *)kzalloc(sizeof(char)*2*MD5_DIGEST_SIZE+1, GFP_KERNEL);
 			if(!md5str){
 				pr_err("null md5str\n");
 				//return PAGE_ACTIVATE;	
 				goto keep_locked;
 			}
-			md5_cal(page_address(page),4096,0, page_to_pfn(page), md5str);
-
-			printk("Page Hash Calculated\n");
 			char *pid_str = (char *)kzalloc(sizeof(char)*8, GFP_KERNEL);
 			int pid = (int) (task_pid_nr(current));
 			sprintf(pid_str, "%d", pid);
 
-			printk("Writing to the struct\n");
-			struct write_msg msg;
-			strncpy(msg.pid, pid_str, 16);
-			strncpy(msg.hash, md5str, 32);
-			msg.pfn = page_to_pfn(page);
+			struct socket *conn_socket = sc->ctr_sock;
 
-			printk("Writing to file\n");
-			file_write("/tmp/md5.dat", &msg);
+			// Create chunks of 48 bytes and use those
+			int it;
+			for (it = 0; it < 4048; it++) {
+				md5_cal(page_address(page) + it, 48, 0, page_to_pfn(page), md5str);
+				if (md5str[31] == '0' && md5str[30] == '0') {
+					struct send_msg msg;
+					strncpy(msg.ops, "add", 8);
+					strncpy(msg.hostid, "10.10.1.4", 16);
+					strncpy(msg.pid, pid_str, 16);
+					strncpy(msg.hash_v, md5str, 32);
+					msg.pfn = page_to_pfn(page);
+					msg.flag = 0;
+					tcp_client_send(conn_socket, &msg, sizeof(struct send_msg), MSG_DONTWAIT);
+				}
+			}
+
+			/*
+			DECLARE_WAIT_QUEUE_HEAD(recv_wait);
+			wait_event_timeout(recv_wait,!skb_queue_empty(&conn_socket->sk->sk_receive_queue), HZ);
+
+			if(!skb_queue_empty(&conn_socket->sk->sk_receive_queue))
+			{
+				unsigned long bitmap;
+				unsigned long bitmap2 =    tcp_client_receive(conn_socket, &bitmap , MSG_DONTWAIT);
+				printk("bitmap =%lu\n", bitmap2);
+				if(bitmap2 == 1)
+					goto keep_locked;
+				else
+					set_bit(PG_swapbit,  &(page)->flags);
+			}
+			*/
+
+		
+
 
 			/*
 			 * Page is dirty. Flush the TLB if a writable entry
@@ -3216,7 +3385,7 @@ unsigned long try_to_free_mem_cgroup_pages(struct mem_cgroup *memcg,
 	current->flags &= ~PF_MEMALLOC;
 
 	trace_mm_vmscan_memcg_reclaim_end(nr_reclaimed);
-
+	pr_info("%s, try to do the tcp_connection here\n", __func__);
 	return nr_reclaimed;
 }
 #endif
