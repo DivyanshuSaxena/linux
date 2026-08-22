@@ -116,6 +116,30 @@ result.
 
 
 
+4.1  PELT HALF-LIFE
+-------------------
+
+Per-Entity Load Tracking decays an entity's history with a half-life of ~32ms,
+the period over which a contribution loses half its weight.  That period is
+tunable at run time (CONFIG_SMP and CONFIG_SCHED_DEBUG):
+
+   /sys/kernel/debug/sched/pelt_halflife_ms
+
+Accepted values are the powers of two from 8 to 512; the default of 32 is the
+historical behaviour.  A shorter half-life makes load and utilisation track a
+task's recent demand more closely at the cost of reacting to noise; a longer
+one smooths bursts but is slower to notice a task that has become busy.
+
+The knob scales the unit of time PELT accumulates in rather than the decay
+table itself, so it is the same mechanism as a PELT multiplier: halving the
+unit makes PELT time run twice as fast and halves the half-life, while
+LOAD_AVG_MAX and every divider derived from it are unchanged.  Restricting
+values to powers of two is what keeps that scaling a shift.
+
+A new value applies from each entity's next update onwards, and sums already
+accumulated under the old setting are not rescaled, so the signals converge on
+the new timescale over a few half-lives rather than changing at once.
+
 5. Scheduling policies
 ======================
 

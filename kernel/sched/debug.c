@@ -214,6 +214,23 @@ static const struct file_operations sched_scaling_fops = {
 	.release	= single_release,
 };
 
+static int sched_pelt_halflife_get(void *data, u64 *val)
+{
+	*val = READ_ONCE(sysctl_sched_pelt_halflife_ms);
+	return 0;
+}
+
+static int sched_pelt_halflife_set(void *data, u64 val)
+{
+	if (val > UINT_MAX)
+		return -EINVAL;
+
+	return sched_pelt_set_halflife_ms(val);
+}
+
+DEFINE_DEBUGFS_ATTRIBUTE(sched_pelt_halflife_fops, sched_pelt_halflife_get,
+			 sched_pelt_halflife_set, "%llu\n");
+
 #endif /* SMP */
 
 #ifdef CONFIG_PREEMPT_DYNAMIC
@@ -355,6 +372,8 @@ static __init int sched_init_debug(void)
 #ifdef CONFIG_SMP
 	debugfs_create_file("tunable_scaling", 0644, debugfs_sched, NULL, &sched_scaling_fops);
 	debugfs_create_u32("migration_cost_ns", 0644, debugfs_sched, &sysctl_sched_migration_cost);
+	debugfs_create_file_unsafe("pelt_halflife_ms", 0644, debugfs_sched, NULL,
+				   &sched_pelt_halflife_fops);
 	debugfs_create_u32("nr_migrate", 0644, debugfs_sched, &sysctl_sched_nr_migrate);
 
 	mutex_lock(&sched_domains_mutex);

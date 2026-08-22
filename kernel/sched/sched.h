@@ -2553,6 +2553,12 @@ extern const_debug unsigned int sysctl_sched_migration_cost;
 
 extern unsigned int sysctl_sched_base_slice;
 
+#ifdef CONFIG_SMP
+extern unsigned int sysctl_sched_pelt_unit_shift;
+extern unsigned int sysctl_sched_pelt_halflife_ms;
+extern int sched_pelt_set_halflife_ms(unsigned int ms);
+#endif
+
 #ifdef CONFIG_SCHED_DEBUG
 extern int sysctl_resched_latency_warn_ms;
 extern int sysctl_resched_latency_warn_once;

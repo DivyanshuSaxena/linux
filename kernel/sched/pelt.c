@@ -25,6 +25,41 @@
  */
 
 /*
+ * The unit PELT accumulates in, as a power-of-two number of nanoseconds. One
+ * decay step spans 1024 units, and the decay table is 32 steps long, so the
+ * half-life is 32768 units: 33.5ms at the default 1024ns unit. Shortening the
+ * unit is the same knob Android exposes as a PELT multiplier -- a 512ns unit
+ * makes PELT time run twice as fast, halving the half-life -- and it leaves
+ * the decay table, LOAD_AVG_PERIOD and LOAD_AVG_MAX alone, so every divider
+ * derived from them stays valid.
+ *
+ * Two things to know when changing it at run time. A new value takes effect at
+ * each entity's next update, and the sums already accumulated under the old
+ * unit are not rescaled, so signals converge on the new timescale over a few
+ * half-lives rather than switching at once. And decay_load()'s flush-to-zero
+ * bound is counted in periods, not in time, so it stretches with the unit: a
+ * blocked entity holds its residue for ~2s at 32ms and ~34s at 512ms.
+ */
+__read_mostly unsigned int sysctl_sched_pelt_unit_shift = 10;
+unsigned int sysctl_sched_pelt_halflife_ms = 32;
+
+/*
+ * Set the PELT half-life. Only powers of two in [8, 512] ms are accepted:
+ * that is what keeps the unit a shift, so the hot path pays a variable shift
+ * where it used to pay a constant one and nothing more.
+ */
+int sched_pelt_set_halflife_ms(unsigned int ms)
+{
+	if (ms < 8 || ms > 512 || !is_power_of_2(ms))
+		return -EINVAL;
+
+	WRITE_ONCE(sysctl_sched_pelt_unit_shift, 5 + ilog2(ms));
+	WRITE_ONCE(sysctl_sched_pelt_halflife_ms, ms);
+
+	return 0;
+}
+
+/*
  * Approximate:
  *   val * y^n,    where y^32 ~= 0.5 (~1 scheduling period)
  */
@@ -106,7 +141,7 @@ accumulate_sum(u64 delta, struct sched_avg *sa,
 	u64 periods;
 
 	delta += sa->period_contrib;
-	periods = delta / 1024; /* A period is 1024us (~1ms) */
+	periods = delta / 1024; /* A period is 1024 units (~1ms by default) */
 
 	/*
 	 * Step 1: decay old *_sum if we crossed period boundaries.
@@ -180,6 +215,7 @@ static __always_inline int
 ___update_load_sum(u64 now, struct sched_avg *sa,
 		  unsigned long load, unsigned long runnable, int running)
 {
+	unsigned int shift;
 	u64 delta;
 
 	delta = now - sa->last_update_time;
@@ -193,14 +229,18 @@ ___update_load_sum(u64 now, struct sched_avg *sa,
 	}
 
 	/*
-	 * Use 1024ns as the unit of measurement since it's a reasonable
-	 * approximation of 1us and fast to compute.
+	 * The unit of measurement defaults to 1024ns, a reasonable
+	 * approximation of 1us and fast to compute, and is scaled by the
+	 * configured half-life. Read the shift once: the two uses below have
+	 * to agree, or last_update_time no longer tracks the time consumed.
 	 */
-	delta >>= 10;
+	shift = READ_ONCE(sysctl_sched_pelt_unit_shift);
+
+	delta >>= shift;
 	if (!delta)
 		return 0;
 
-	sa->last_update_time += delta << 10;
+	sa->last_update_time += delta << shift;
 
 	/*
 	 * running is a subset of runnable (weight) so running can't be set if
