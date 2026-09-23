@@ -262,8 +262,16 @@ bool blk_bio_list_merge(struct request_queue *q, struct list_head *list,
 
 /*
  * Plug flush limits
+ *
+ * BLK_MAX_REQUEST_COUNT is how many requests a plug holds before it is flushed
+ * (twice that once it spans several queues), and the cap on the batch of tags
+ * a plug allocates up front. It is tunable at run time through
+ * /sys/kernel/debug/block/max_request_count; the default is the historical 32.
  */
-#define BLK_MAX_REQUEST_COUNT	32
+#define BLK_MAX_REQUEST_COUNT_DEFAULT	32
+#define BLK_MAX_REQUEST_COUNT_MAX	(USHRT_MAX / 2)
+extern unsigned int sysctl_blk_max_request_count;
+#define BLK_MAX_REQUEST_COUNT	READ_ONCE(sysctl_blk_max_request_count)
 #define BLK_PLUG_FLUSH_SIZE	(128 * 1024)
 
 /*

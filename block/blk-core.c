@@ -53,6 +53,32 @@
 
 struct dentry *blk_debugfs_root;
 
+__read_mostly unsigned int sysctl_blk_max_request_count =
+	BLK_MAX_REQUEST_COUNT_DEFAULT;
+
+static int blk_max_request_count_get(void *data, u64 *val)
+{
+	*val = READ_ONCE(sysctl_blk_max_request_count);
+	return 0;
+}
+
+/*
+ * The upper bound follows from the types: a plug counts its requests and sizes
+ * its tag batch in unsigned shorts, and a plug spanning several queues holds
+ * twice the limit.
+ */
+static int blk_max_request_count_set(void *data, u64 val)
+{
+	if (val < 1 || val > BLK_MAX_REQUEST_COUNT_MAX)
+		return -EINVAL;
+
+	WRITE_ONCE(sysctl_blk_max_request_count, val);
+	return 0;
+}
+
+DEFINE_DEBUGFS_ATTRIBUTE(blk_max_request_count_fops, blk_max_request_count_get,
+			 blk_max_request_count_set, "%llu\n");
+
 EXPORT_TRACEPOINT_SYMBOL_GPL(block_bio_remap);
 EXPORT_TRACEPOINT_SYMBOL_GPL(block_rq_remap);
 EXPORT_TRACEPOINT_SYMBOL_GPL(block_bio_complete);
@@ -1108,7 +1134,8 @@ void blk_start_plug_nr_ios(struct blk_plug *plug, unsigned short nr_ios)
  *   this hint to defer submitting I/Os from the caller until blk_finish_plug()
  *   is called.  However, the block layer may choose to submit requests
  *   before a call to blk_finish_plug() if the number of queued I/Os
- *   exceeds %BLK_MAX_REQUEST_COUNT, or if the size of the I/O is larger than
+ *   exceeds %BLK_MAX_REQUEST_COUNT (/sys/kernel/debug/block/max_request_count),
+ *   or if the size of the I/O is larger than
  *   %BLK_PLUG_FLUSH_SIZE.  The queued I/Os may also be submitted early if
  *   the task schedules (see below).
  *
@@ -1233,6 +1260,8 @@ int __init blk_dev_init(void)
 			sizeof(struct request_queue), 0, SLAB_PANIC, NULL);
 
 	blk_debugfs_root = debugfs_create_dir("block", NULL);
+	debugfs_create_file_unsafe("max_request_count", 0644, blk_debugfs_root,
+				   NULL, &blk_max_request_count_fops);
 
 	return 0;
 }

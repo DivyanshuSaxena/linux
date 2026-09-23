@@ -77,6 +77,16 @@ to sequential access, grouped requests for sequential access decreases the
 number of individual requests. This technique of merging requests is called
 plugging.
 
+A task's plug holds at most 32 requests before it is flushed, or twice that
+once it spans several queues, and it allocates at most that many tags in one
+batch. The limit is tunable at run time (CONFIG_DEBUG_FS)::
+
+   /sys/kernel/debug/block/max_request_count
+
+Accepted values are 1 to 32767; the default of 32 is the historical behaviour.
+A plug that is already open picks the new value up at its next flush check,
+and its tag batch at the next plug.
+
 Along with that, the requests can be reordered to ensure fairness of system
 resources (e.g. to ensure that no application suffers from starvation) and/or to
 improve IO performance, by an IO scheduler.

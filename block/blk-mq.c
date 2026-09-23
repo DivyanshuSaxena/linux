@@ -1278,13 +1278,15 @@ EXPORT_SYMBOL(blk_mq_start_request);
 /*
  * Allow 2x BLK_MAX_REQUEST_COUNT requests on plug queue for multiple
  * queues. This is important for md arrays to benefit from merging
- * requests.
+ * requests. The limit is tunable, so read it once.
  */
 static inline unsigned short blk_plug_max_rq_count(struct blk_plug *plug)
 {
+	unsigned int max = BLK_MAX_REQUEST_COUNT;
+
 	if (plug->multiple_queues)
-		return BLK_MAX_REQUEST_COUNT * 2;
-	return BLK_MAX_REQUEST_COUNT;
+		return max * 2;
+	return max;
 }
 
 static void blk_add_rq_to_plug(struct blk_plug *plug, struct request *rq)
